@@ -1,0 +1,540 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>MigrAssist 設計書</title>
+</head>
+<body>
+
+<h1>MigrAssist 設計書</h1>
+
+<table border="1">
+  <tr><th>バージョン</th><td>0.1</td></tr>
+  <tr><th>作成日</th><td>2026-06-04</td></tr>
+  <tr><th>対象バージョン</th><td>MigrAssist v0.1.0</td></tr>
+</table>
+
+<hr>
+
+<h2>目次</h2>
+<ol>
+  <li><a href="#architecture">アーキテクチャ概要</a></li>
+  <li><a href="#frontend">フロントエンド設計</a>
+    <ol>
+      <li><a href="#fe-components">コンポーネント構成</a></li>
+      <li><a href="#fe-state">状態管理</a></li>
+      <li><a href="#fe-types">型定義</a></li>
+      <li><a href="#fe-api">API層</a></li>
+    </ol>
+  </li>
+  <li><a href="#backend">バックエンド設計</a>
+    <ol>
+      <li><a href="#be-modules">モジュール構成</a></li>
+      <li><a href="#be-types">型定義</a></li>
+      <li><a href="#be-commands">コマンドハンドラ</a></li>
+      <li><a href="#be-comparison">突合処理ロジック</a></li>
+      <li><a href="#be-csv">CSV読み込み処理</a></li>
+      <li><a href="#be-config">設定管理</a></li>
+    </ol>
+  </li>
+  <li><a href="#dataflow">データフロー</a></li>
+  <li><a href="#files">ファイル構成</a></li>
+</ol>
+
+<hr>
+
+<h2 id="architecture">1. アーキテクチャ概要</h2>
+
+<h3>1.1 レイヤー構成</h3>
+<p>
+  Tauri 2 のデスクトップアプリケーションとして、フロントエンド（React/TypeScript）と
+  バックエンド（Rust）を Tauri IPC ブリッジで接続する2層構成。
+</p>
+
+<pre>
+┌────────────────────────────────────────────────────────────┐
+│  フロントエンド（Webビュー）                                │
+│                                                            │
+│  App.tsx                                                   │
+│  ├─ useAppState（状態管理フック）                          │
+│  ├─ FileInputSection コンポーネント × 2                    │
+│  ├─ MappingTable コンポーネント                            │
+│  └─ ProgressBar コンポーネント                             │
+│                                                            │
+│  api/tauri.ts（Tauriコマンド呼び出しの窓口）               │
+└─────────────────────────┬──────────────────────────────────┘
+                          │ Tauri IPC（invoke / event）
+┌─────────────────────────▼──────────────────────────────────┐
+│  バックエンド（Rustバイナリ）                               │
+│                                                            │
+│  commands.rs（コマンドハンドラ・バリデーション）            │
+│  ├─ csv_reader.rs（CSVファイル読み込み・文字コード変換）    │
+│  ├─ comparison.rs（突合処理コアロジック）                  │
+│  └─ config.rs（設定ファイル保存・読み込み）                │
+└────────────────────────────────────────────────────────────┘
+</pre>
+
+<h3>1.2 通信方式</h3>
+<table border="1">
+  <tr><th>方向</th><th>方式</th><th>用途</th></tr>
+  <tr>
+    <td>フロント → バック</td>
+    <td>Tauri <code>invoke</code>（同期的なコマンド呼び出し）</td>
+    <td>CSV読み込み、突合実行、設定保存・読み込み</td>
+  </tr>
+  <tr>
+    <td>バック → フロント</td>
+    <td>Tauri イベント（<code>emit</code> / <code>listen</code>）</td>
+    <td>突合処理中の進捗通知（<code>comparison-progress</code> イベント）</td>
+  </tr>
+</table>
+
+<hr>
+
+<h2 id="frontend">2. フロントエンド設計</h2>
+
+<h3 id="fe-components">2.1 コンポーネント構成</h3>
+
+<table border="1">
+  <tr><th>コンポーネント</th><th>ファイル</th><th>役割</th></tr>
+  <tr>
+    <td>App</td>
+    <td><code>src/App.tsx</code></td>
+    <td>
+      メイン画面レイアウト。<code>useAppState</code> フックからすべての状態とハンドラを取得し、
+      各セクションへ Props として渡す。
+    </td>
+  </tr>
+  <tr>
+    <td>FileInputSection</td>
+    <td><code>src/components/FileInputSection.tsx</code></td>
+    <td>
+      ファイルパス入力・文字コード選択・参照ボタンをまとめたUI部品。
+      MJSシステム・他社システムの2箇所で共用する。
+    </td>
+  </tr>
+  <tr>
+    <td>MappingTable</td>
+    <td><code>src/components/MappingTable.tsx</code></td>
+    <td>
+      突合設定テーブル。4行（比較対象・MJSシステム・他社システム・許容誤差）×
+      列数（MJSのヘッダー数）の構成。
+      CSVが未取込の場合はガイドメッセージを表示する。
+    </td>
+  </tr>
+  <tr>
+    <td>ProgressBar</td>
+    <td><code>src/components/ProgressBar.tsx</code></td>
+    <td>
+      突合実行中のみ表示される進捗バー。
+      バックエンドから受信した <code>step</code> / <code>total</code> を元に幅を計算する。
+    </td>
+  </tr>
+</table>
+
+<h4>FileInputSection Props</h4>
+<table border="1">
+  <tr><th>Prop</th><th>型</th><th>説明</th></tr>
+  <tr><td>label</td><td>string</td><td>ラベルテキスト（「MJSシステム」など）</td></tr>
+  <tr><td>path</td><td>string</td><td>現在のファイルパス</td></tr>
+  <tr><td>encoding</td><td>Encoding</td><td>選択中の文字コード</td></tr>
+  <tr><td>onPathChange</td><td>(path: string) =&gt; void</td><td>パス変更時のコールバック</td></tr>
+  <tr><td>onEncodingChange</td><td>(enc: Encoding) =&gt; void</td><td>文字コード変更時のコールバック</td></tr>
+  <tr><td>onBrowse</td><td>() =&gt; void</td><td>参照ボタンクリック時のコールバック</td></tr>
+</table>
+
+<h4>MappingTable Props</h4>
+<table border="1">
+  <tr><th>Prop</th><th>型</th><th>説明</th></tr>
+  <tr><td>columns</td><td>ColumnMapping[]</td><td>突合設定列の配列</td></tr>
+  <tr><td>otherHeaders</td><td>string[]</td><td>他社システムCSVの全ヘッダー（プルダウン用）</td></tr>
+  <tr><td>onUpdate</td><td>(idx, patch) =&gt; void</td><td>列の設定変更時のコールバック</td></tr>
+</table>
+
+<h3 id="fe-state">2.2 状態管理</h3>
+
+<p>
+  すべてのアプリ状態を <code>src/hooks/useAppState.ts</code> の <code>useAppState</code> カスタムフックで一元管理する。
+  React の <code>useState</code> と <code>useCallback</code> を使い、状態とその更新関数を一つのフックにまとめる。
+</p>
+
+<h4>AppState の構造</h4>
+<table border="1">
+  <tr><th>フィールド</th><th>型</th><th>説明</th></tr>
+  <tr><td>mjsPath</td><td>string</td><td>MJSシステムCSVのファイルパス</td></tr>
+  <tr><td>mjsEncoding</td><td>Encoding</td><td>MJSシステムCSVの文字コード</td></tr>
+  <tr><td>otherPath</td><td>string</td><td>他社システムCSVのファイルパス</td></tr>
+  <tr><td>otherEncoding</td><td>Encoding</td><td>他社システムCSVの文字コード</td></tr>
+  <tr><td>mjsHeaders</td><td>string[] | null</td><td>取り込んだMJSのヘッダー（未取込はnull）</td></tr>
+  <tr><td>otherHeaders</td><td>string[] | null</td><td>取り込んだ他社システムのヘッダー（未取込はnull）</td></tr>
+  <tr><td>columns</td><td>ColumnMapping[]</td><td>突合設定列の配列</td></tr>
+  <tr><td>outputDir</td><td>string</td><td>出力フォルダパス</td></tr>
+  <tr><td>isRunning</td><td>boolean</td><td>突合処理の実行中フラグ</td></tr>
+  <tr><td>progress</td><td>ProgressPayload | null</td><td>最新の進捗情報</td></tr>
+  <tr><td>error</td><td>string | null</td><td>エラーメッセージ（なければnull）</td></tr>
+</table>
+
+<h4>フック内部のヘルパー関数</h4>
+<table border="1">
+  <tr><th>関数</th><th>説明</th></tr>
+  <tr>
+    <td>buildColumns(mjsHeaders, otherHeaders)</td>
+    <td>
+      MJSヘッダーを元に初期の <code>ColumnMapping[]</code> を生成する。
+      他社ヘッダーと名称が完全一致する場合は <code>otherHeader</code> を自動設定。
+      先頭列（index=0）は <code>isCompare: false</code> に固定する。
+    </td>
+  </tr>
+  <tr>
+    <td>makeTimestamp()</td>
+    <td>実行時の <code>yyyymmddhhmm</code> 形式タイムスタンプ文字列を生成する。</td>
+  </tr>
+  <tr>
+    <td>buildHeaderMismatchError(configHeaders, csvHeaders)</td>
+    <td>
+      設定ファイルのヘッダーと現在のCSVヘッダーを比較し、不一致があれば
+      差分を列挙したエラーメッセージを返す。一致している場合は null を返す。
+    </td>
+  </tr>
+</table>
+
+<h3 id="fe-types">2.3 型定義</h3>
+
+<p>ファイル：<code>src/types/index.ts</code></p>
+
+<table border="1">
+  <tr><th>型名</th><th>種別</th><th>説明</th></tr>
+  <tr>
+    <td>Encoding</td>
+    <td>Union型</td>
+    <td><code>'sjis' | 'utf-8' | 'utf-8-bom'</code> — 文字コードの選択肢</td>
+  </tr>
+  <tr>
+    <td>ColumnMapping</td>
+    <td>interface</td>
+    <td>突合設定の1列分。mjsHeader / otherHeader / isCompare / tolerance</td>
+  </tr>
+  <tr>
+    <td>ComparisonConfig</td>
+    <td>interface</td>
+    <td>バックエンドへ渡す突合実行の設定全体</td>
+  </tr>
+  <tr>
+    <td>ConfigData</td>
+    <td>interface</td>
+    <td>設定ファイルの保存・読み込みに使う型（columns のみを持つ）</td>
+  </tr>
+  <tr>
+    <td>ProgressPayload</td>
+    <td>interface</td>
+    <td>進捗イベントのペイロード。message / step / total</td>
+  </tr>
+</table>
+
+<h3 id="fe-api">2.4 API層</h3>
+
+<p>ファイル：<code>src/api/tauri.ts</code></p>
+<p>Tauri IPC 呼び出しを関数としてラップし、コンポーネントや hooks から直接 invoke を書かなくて済むようにする層。</p>
+
+<table border="1">
+  <tr><th>関数</th><th>説明</th></tr>
+  <tr><td>loadCsv(path, encoding)</td><td>CSVファイルのヘッダー行を読み込んで返す</td></tr>
+  <tr><td>executeComparison(config)</td><td>突合処理を実行する（進捗はイベントで受信）</td></tr>
+  <tr><td>saveConfig(path, data)</td><td>突合設定をJSONファイルに保存する</td></tr>
+  <tr><td>loadConfig(path)</td><td>JSONファイルから突合設定を読み込む</td></tr>
+  <tr><td>pickCsvFile()</td><td>CSVファイル選択ダイアログを開く</td></tr>
+  <tr><td>pickJsonFileForOpen()</td><td>JSONファイルを開くダイアログを開く</td></tr>
+  <tr><td>pickJsonFileForSave()</td><td>JSONファイルの保存先ダイアログを開く</td></tr>
+  <tr><td>pickDirectory()</td><td>フォルダ選択ダイアログを開く</td></tr>
+  <tr><td>showCompletionDialog()</td><td>完了ダイアログを表示する</td></tr>
+</table>
+
+<hr>
+
+<h2 id="backend">3. バックエンド設計</h2>
+
+<h3 id="be-modules">3.1 モジュール構成</h3>
+<table border="1">
+  <tr><th>ファイル</th><th>役割</th></tr>
+  <tr><td>lib.rs</td><td>Tauriアプリの初期化。プラグイン登録とコマンドハンドラの登録を行う</td></tr>
+  <tr><td>main.rs</td><td>エントリーポイント。<code>lib::run()</code> を呼ぶだけ</td></tr>
+  <tr><td>types.rs</td><td>フロントエンドと共有する構造体の定義（serde による JSON シリアライズ対応）</td></tr>
+  <tr><td>commands.rs</td><td>Tauriコマンドハンドラと実行前バリデーション</td></tr>
+  <tr><td>csv_reader.rs</td><td>CSVファイルの読み込み・文字コード変換・ヘッダー解析</td></tr>
+  <tr><td>comparison.rs</td><td>突合処理のコアアルゴリズムと出力CSV生成</td></tr>
+  <tr><td>config.rs</td><td>突合設定のJSON保存・読み込み</td></tr>
+</table>
+
+<h3 id="be-types">3.2 型定義（types.rs）</h3>
+<table border="1">
+  <tr><th>構造体</th><th>説明</th><th>serde</th></tr>
+  <tr><td>ColumnMapping</td><td>突合設定の1列分</td><td>camelCase, Serialize/Deserialize/Clone</td></tr>
+  <tr><td>ComparisonConfig</td><td>突合実行設定全体（パス・文字コード・列設定・タイムスタンプ）</td><td>camelCase, Serialize/Deserialize</td></tr>
+  <tr><td>SummaryRow</td><td>サマリーCSVの1行分（item_name / result）</td><td>camelCase, Serialize/Deserialize</td></tr>
+  <tr><td>ComparisonResult</td><td>突合処理の結果（summary / summary_file / detail_file）</td><td>camelCase, Serialize/Deserialize</td></tr>
+  <tr><td>ConfigData</td><td>設定ファイルの構造（columns のみ）</td><td>camelCase, Serialize/Deserialize/Clone</td></tr>
+  <tr><td>ProgressPayload</td><td>進捗イベントのペイロード（message / step / total）</td><td>camelCase, Serialize/Clone</td></tr>
+</table>
+
+<p>
+  Rustのフィールド名はスネークケース（例：<code>mjs_header</code>）だが、
+  <code>#[serde(rename_all = "camelCase")]</code> によりJSON上はキャメルケース（例：<code>mjsHeader</code>）に変換される。
+  これによりフロントエンドのTypeScript型定義と自然に対応する。
+</p>
+
+<h3 id="be-commands">3.3 コマンドハンドラ（commands.rs）</h3>
+
+<table border="1">
+  <tr><th>コマンド</th><th>種別</th><th>説明</th></tr>
+  <tr>
+    <td>load_csv</td>
+    <td>同期</td>
+    <td>パスと文字コードを受け取り、CSVのヘッダー行を返す</td>
+  </tr>
+  <tr>
+    <td>execute_comparison</td>
+    <td>非同期</td>
+    <td>
+      <code>validate_config</code> でバリデーション後、
+      <code>tokio::task::spawn_blocking</code> でブロッキングスレッドに突合処理を委譲する。
+      処理中は <code>comparison-progress</code> イベントを emit して進捗を通知する。
+    </td>
+  </tr>
+  <tr>
+    <td>save_config</td>
+    <td>同期</td>
+    <td>突合設定をJSONファイルに保存する</td>
+  </tr>
+  <tr>
+    <td>load_config</td>
+    <td>同期</td>
+    <td>JSONファイルから突合設定を読み込む</td>
+  </tr>
+</table>
+
+<h4>validate_config のチェック項目</h4>
+<ol>
+  <li>MJSシステムのCSVパスが空でない</li>
+  <li>他社システムのCSVパスが空でない</li>
+  <li>出力フォルダパスが空でない</li>
+  <li>columns が空でない（ファイル取込済みであること）</li>
+  <li>先頭列（キー列）の <code>other_header</code> が選択済み</li>
+  <li>比較対象列（<code>is_compare = true</code>）が1件以上存在する</li>
+  <li>比較対象列すべての <code>other_header</code> が選択済み</li>
+</ol>
+
+<h3 id="be-comparison">3.4 突合処理ロジック（comparison.rs）</h3>
+
+<h4>内部型</h4>
+<table border="1">
+  <tr><th>型</th><th>説明</th></tr>
+  <tr><td>ColInfo</td><td>比較列1件の情報（ColumnMapping参照 + MJSのCSVインデックス + 他社のCSVインデックス）</td></tr>
+  <tr><td>DetailRow</td><td>明細CSV1行分のデータ（key / mjs_val / other_val / diff）</td></tr>
+  <tr><td>ComparisonStats</td><td>比較ループの集計結果（不一致件数配列 / 明細行配列 / 片側のみカウント）</td></tr>
+</table>
+
+<h4>run() の処理フロー</h4>
+<ol>
+  <li>MJSシステムCSVを読み込む（on_progress: 1/6）</li>
+  <li>他社システムCSVを読み込む（on_progress: 2/6）</li>
+  <li>キー列・比較列のCSVインデックスを解決する（on_progress: 3/6）</li>
+  <li><code>build_mjs_index</code> でMJSレコードをHashMapに格納する</li>
+  <li><code>compare_records</code> で他社レコードと突合する</li>
+  <li>サマリーCSVを生成する（on_progress: 4/6）</li>
+  <li>明細CSVを生成する（on_progress: 5/6）</li>
+  <li>ファイルを出力する（on_progress: 6/6）</li>
+</ol>
+
+<h4>compare_records() の処理</h4>
+<ol>
+  <li>他社CSVの全レコードを1行ずつ処理する：
+    <ul>
+      <li>キー値でMJSのHashMapを検索する</li>
+      <li>マッチした場合：各比較列を <code>values_match</code> で突合し、不一致なら <code>DetailRow</code> を追加する</li>
+      <li>マッチしない場合：<code>other_only_count</code> をインクリメントし、全比較列に他社値のみの <code>DetailRow</code> を追加する</li>
+    </ul>
+  </li>
+  <li>MJSレコードのうち他社CSVにマッチしなかったものを検出する（mjs_only）：
+    <ul>
+      <li><code>mjs_only_count</code> をインクリメントし、全比較列にMJS値のみの <code>DetailRow</code> を追加する</li>
+    </ul>
+  </li>
+</ol>
+
+<h4>values_match() の判定ロジック</h4>
+<table border="1">
+  <tr><th>条件</th><th>判定方法</th></tr>
+  <tr><td>tolerance = 0</td><td>文字列として完全一致（<code>mjs_val == other_val</code>）</td></tr>
+  <tr><td>tolerance &gt; 0、両方 f64 変換可能</td><td>絶対差 ≤ tolerance</td></tr>
+  <tr><td>tolerance &gt; 0、どちらか変換不可</td><td>文字列として完全一致（フォールバック）</td></tr>
+</table>
+
+<h4>ファイル出力</h4>
+<ul>
+  <li>文字コード：UTF-8 BOM付き（ExcelでCSVを直接開けるようにするため BOM = EF BB BF を先頭に付与）</li>
+  <li>明細CSVが空（不一致が一件もない）の場合は明細ファイルを生成しない</li>
+</ul>
+
+<h3 id="be-csv">3.5 CSV読み込み処理（csv_reader.rs）</h3>
+
+<h4>公開関数</h4>
+<table border="1">
+  <tr><th>関数</th><th>説明</th></tr>
+  <tr><td>read_headers(path, encoding)</td><td>ヘッダー行のみを返す（ファイル取込時に使用）</td></tr>
+  <tr><td>read_records(path, encoding)</td><td>ヘッダーと全データ行を返す（突合実行時に使用）</td></tr>
+</table>
+
+<h4>内部ヘルパー関数</h4>
+<table border="1">
+  <tr><th>関数</th><th>説明</th></tr>
+  <tr><td>read_as_text(path, encoding)</td><td>ファイルを読み込み、指定文字コードでデコードしてテキストを返す</td></tr>
+  <tr><td>make_csv_reader(text)</td><td>テキストから csv::Reader を構築する</td></tr>
+  <tr><td>collect_csv_headers(reader)</td><td>Reader からヘッダーを収集し、空チェックを行う</td></tr>
+  <tr><td>decode_bytes(bytes, encoding)</td><td>encoding_rs クレートを使って SJIS または UTF-8 にデコードする。BOM は除去する</td></tr>
+</table>
+
+<h4>対応文字コード</h4>
+<table border="1">
+  <tr><th>指定値</th><th>処理</th></tr>
+  <tr><td><code>sjis</code></td><td>SHIFT_JIS でデコード</td></tr>
+  <tr><td><code>utf-8</code></td><td>UTF-8 でデコード</td></tr>
+  <tr><td><code>utf-8-bom</code></td><td>UTF-8 でデコード（BOM は trim_start_matches で除去）</td></tr>
+</table>
+
+<h3 id="be-config">3.6 設定管理（config.rs）</h3>
+<table border="1">
+  <tr><th>関数</th><th>説明</th></tr>
+  <tr><td>save(path, config)</td><td>ConfigData を serde_json::to_string_pretty で整形してファイルに書き出す</td></tr>
+  <tr><td>load(path)</td><td>ファイルを読み込み serde_json::from_str でパースして ConfigData を返す</td></tr>
+</table>
+
+<hr>
+
+<h2 id="dataflow">4. データフロー</h2>
+
+<h3>4.1 ファイル取込フロー</h3>
+<pre>
+[ユーザー] ファイルパスを入力して「ファイル取込」をクリック
+     ↓
+[useAppState::loadFiles]
+  Promise.all で MJS・他社 の load_csv を並列実行
+     ↓
+[Rust: commands::load_csv]
+  csv_reader::read_headers(path, encoding)
+    → read_as_text でバイト読み込み＆デコード
+    → make_csv_reader → collect_csv_headers
+  → Vec&lt;String&gt; (ヘッダーリスト) を返す
+     ↓
+[useAppState]
+  mjsHeaders / otherHeaders を更新
+  buildColumns() で ColumnMapping[] を生成
+  columns を更新 → MappingTable が再描画される
+</pre>
+
+<h3>4.2 突合実行フロー</h3>
+<pre>
+[ユーザー]「実行」をクリック
+     ↓
+[useAppState::execute]
+  isRunning = true
+  comparison-progress イベントの listen を開始
+  api.executeComparison(config) を呼び出す
+     ↓
+[Rust: commands::execute_comparison]
+  validate_config でバリデーション
+  tokio::spawn_blocking で comparison::run() を実行
+     ↓
+[Rust: comparison::run]
+  Step1: MJS CSV を read_records で読み込み → emit progress(1/6)
+  Step2: 他社 CSV を read_records で読み込み → emit progress(2/6)
+  Step3: インデックス解決・build_mjs_index → emit progress(3/6)
+  Step4: compare_records で突合ループ
+         不一致・片側のみを集計
+  Step5: build_summary_csv → emit progress(4/6)
+  Step6: build_detail_csv → emit progress(5/6)
+  Step7: write_bom_csv でファイル出力 → emit progress(6/6)
+  → ComparisonResult を返す
+     ↓
+[Tauri イベント: comparison-progress]
+  フロントエンドの listen コールバック → progress 状態を更新
+  → ProgressBar が再描画される
+     ↓
+[useAppState::execute (finally)]
+  unlisten でイベントリスナーを解除
+  isRunning = false
+  api.showCompletionDialog() で完了ダイアログを表示
+</pre>
+
+<h3>4.3 設定保存・読み込みフロー</h3>
+<pre>
+【保存】
+[ユーザー]「設定出力」をクリック
+  → pickJsonFileForSave() でファイル保存ダイアログ
+  → api.saveConfig(path, { columns }) を呼び出す
+  → Rust: config::save() が JSON に書き出す
+
+【読み込み】
+[ユーザー]「設定取込」をクリック
+  → pickJsonFileForOpen() でファイル選択ダイアログ
+  → api.loadConfig(path) を呼び出す
+  → Rust: config::load() が JSON を読み込み ConfigData を返す
+  → buildHeaderMismatchError() でヘッダー不一致チェック
+      不一致あり → エラー表示して中断
+      一致 → state.columns を更新 → MappingTable が再描画される
+</pre>
+
+<hr>
+
+<h2 id="files">5. ファイル構成</h2>
+<pre>
+MigrAssist/
+├── README.md
+├── claude.md                   # 仕様のベースとなるドラフト文書
+├── docs/                       # 各種ドキュメント（本ファイルを含む）
+├── index.html                  # Viteのエントリーポイント
+├── package.json
+├── vite.config.ts
+├── tsconfig.json
+├── src/                        # フロントエンド
+│   ├── main.tsx                # Reactルート
+│   ├── App.tsx                 # メイン画面
+│   ├── App.css                 # スタイルシート
+│   ├── types/
+│   │   └── index.ts            # 型定義
+│   ├── api/
+│   │   └── tauri.ts            # Tauri IPC ラッパー
+│   ├── hooks/
+│   │   └── useAppState.ts      # 状態管理フック
+│   └── components/
+│       ├── FileInputSection.tsx
+│       ├── MappingTable.tsx
+│       └── ProgressBar.tsx
+└── src-tauri/                  # バックエンド
+    ├── Cargo.toml
+    ├── tauri.conf.json
+    ├── capabilities/
+    │   └── default.json
+    └── src/
+        ├── main.rs
+        ├── lib.rs
+        ├── types.rs
+        ├── commands.rs
+        ├── comparison.rs
+        ├── csv_reader.rs
+        └── config.rs
+</pre>
+
+<h3>主な依存クレート（Rust）</h3>
+<table border="1">
+  <tr><th>クレート</th><th>用途</th></tr>
+  <tr><td>tauri 2</td><td>デスクトップアプリフレームワーク</td></tr>
+  <tr><td>tauri-plugin-dialog 2</td><td>ファイル・フォルダ選択ダイアログ</td></tr>
+  <tr><td>tauri-plugin-opener 2</td><td>外部ファイルを開く機能</td></tr>
+  <tr><td>serde / serde_json</td><td>JSONシリアライズ・デシリアライズ</td></tr>
+  <tr><td>encoding_rs</td><td>SJIS / UTF-8 文字コード変換</td></tr>
+  <tr><td>csv</td><td>CSVパース</td></tr>
+  <tr><td>tokio</td><td>非同期ランタイム（spawn_blocking に使用）</td></tr>
+</table>
+
+</body>
+</html>
