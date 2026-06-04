@@ -299,3 +299,258 @@ where
         detail_file,
     })
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::ColumnMapping;
+
+    fn col(mjs: &str, other: &str, tolerance: i32) -> ColumnMapping {
+        ColumnMapping {
+            mjs_header: mjs.to_string(),
+            other_header: other.to_string(),
+            is_compare: true,
+            tolerance,
+        }
+    }
+
+    // ── values_match ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn values_match_equal_strings() {
+        assert!(values_match("abc", "abc", 0));
+    }
+
+    #[test]
+    fn values_match_different_strings() {
+        assert!(!values_match("abc", "xyz", 0));
+    }
+
+    #[test]
+    fn values_match_empty_strings_are_equal() {
+        assert!(values_match("", "", 0));
+    }
+
+    #[test]
+    fn values_match_within_tolerance() {
+        assert!(values_match("10", "12", 2));
+    }
+
+    #[test]
+    fn values_match_at_tolerance_boundary() {
+        assert!(values_match("10", "12", 2));  // diff=2, ちょうど境界
+        assert!(!values_match("10", "13", 2)); // diff=3, 境界超え
+    }
+
+    #[test]
+    fn values_match_negative_diff_within_tolerance() {
+        assert!(values_match("8", "10", 2)); // diff=-2
+    }
+
+    #[test]
+    fn values_match_non_numeric_with_tolerance_falls_back_to_string() {
+        assert!(values_match("abc", "abc", 5));
+        assert!(!values_match("abc", "xyz", 5));
+    }
+
+    #[test]
+    fn values_match_one_side_non_numeric_falls_back_to_string() {
+        assert!(!values_match("10", "abc", 5));
+    }
+
+    #[test]
+    fn values_match_different_numeric_representations_at_zero_tolerance() {
+        // "100" と "100.0" は tolerance=0 の文字列比較では不一致
+        assert!(!values_match("100", "100.0", 0));
+    }
+
+    // ── compute_diff ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn compute_diff_positive_integer() {
+        assert_eq!(compute_diff("10", "7"), "3");
+    }
+
+    #[test]
+    fn compute_diff_negative_result() {
+        assert_eq!(compute_diff("5", "8"), "-3");
+    }
+
+    #[test]
+    fn compute_diff_zero() {
+        assert_eq!(compute_diff("5", "5"), "0");
+    }
+
+    #[test]
+    fn compute_diff_float_result() {
+        assert_eq!(compute_diff("10.5", "10.0"), "0.5");
+    }
+
+    #[test]
+    fn compute_diff_both_non_numeric_returns_empty() {
+        assert_eq!(compute_diff("abc", "xyz"), "");
+    }
+
+    #[test]
+    fn compute_diff_one_non_numeric_returns_empty() {
+        assert_eq!(compute_diff("10", "abc"), "");
+    }
+
+    // ── csv_escape ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn csv_escape_plain_text_unchanged() {
+        assert_eq!(csv_escape("hello"), "hello");
+    }
+
+    #[test]
+    fn csv_escape_empty_string_unchanged() {
+        assert_eq!(csv_escape(""), "");
+    }
+
+    #[test]
+    fn csv_escape_with_comma_wraps_in_quotes() {
+        assert_eq!(csv_escape("a,b"), "\"a,b\"");
+    }
+
+    #[test]
+    fn csv_escape_with_double_quote_doubles_it() {
+        assert_eq!(csv_escape("say \"hi\""), "\"say \"\"hi\"\"\"");
+    }
+
+    #[test]
+    fn csv_escape_with_newline_wraps_in_quotes() {
+        assert_eq!(csv_escape("line1\nline2"), "\"line1\nline2\"");
+    }
+
+    // ── build_mjs_index ───────────────────────────────────────────────────────
+
+    #[test]
+    fn build_mjs_index_maps_key_to_record() {
+        let records = vec![
+            vec!["1001".to_string(), "20".to_string()],
+            vec!["1002".to_string(), "18".to_string()],
+        ];
+        let index = build_mjs_index(&records);
+        assert_eq!(index.len(), 2);
+        assert_eq!(index["1001"][1], "20");
+        assert_eq!(index["1002"][1], "18");
+    }
+
+    #[test]
+    fn build_mjs_index_duplicate_key_keeps_last_record() {
+        let records = vec![
+            vec!["1001".to_string(), "10".to_string()],
+            vec!["1001".to_string(), "99".to_string()], // 後のレコードで上書き
+        ];
+        let index = build_mjs_index(&records);
+        assert_eq!(index.len(), 1);
+        assert_eq!(index["1001"][1], "99");
+    }
+
+    #[test]
+    fn build_mjs_index_empty_records_returns_empty_map() {
+        let records: Vec<Vec<String>> = vec![];
+        assert!(build_mjs_index(&records).is_empty());
+    }
+
+    // ── compare_records ───────────────────────────────────────────────────────
+
+    #[test]
+    fn compare_records_all_match() {
+        let mapping = col("出勤日数", "WORK_DAYS", 0);
+        let info = ColInfo { mapping: &mapping, mjs_idx: 1, other_idx: 1 };
+        let mjs = vec![
+            vec!["1001".to_string(), "20".to_string()],
+            vec!["1002".to_string(), "18".to_string()],
+        ];
+        let other = vec![
+            vec!["1001".to_string(), "20".to_string()],
+            vec!["1002".to_string(), "18".to_string()],
+        ];
+        let idx = build_mjs_index(&mjs);
+        let stats = compare_records(&idx, &mjs, &other, 0, &[info]);
+
+        assert_eq!(stats.mismatch_counts[0], 0);
+        assert_eq!(stats.mjs_only_count, 0);
+        assert_eq!(stats.other_only_count, 0);
+    }
+
+    #[test]
+    fn compare_records_detects_mismatch() {
+        let mapping = col("出勤日数", "WORK_DAYS", 0);
+        let info = ColInfo { mapping: &mapping, mjs_idx: 1, other_idx: 1 };
+        let mjs = vec![
+            vec!["1001".to_string(), "20".to_string()],
+            vec!["1002".to_string(), "18".to_string()],
+        ];
+        let other = vec![
+            vec!["1001".to_string(), "20".to_string()],
+            vec!["1002".to_string(), "15".to_string()], // 不一致
+        ];
+        let idx = build_mjs_index(&mjs);
+        let stats = compare_records(&idx, &mjs, &other, 0, &[info]);
+
+        assert_eq!(stats.mismatch_counts[0], 1);
+        assert_eq!(stats.detail_entries[0][0].key, "1002");
+        assert_eq!(stats.detail_entries[0][0].mjs_val, "18");
+        assert_eq!(stats.detail_entries[0][0].other_val, "15");
+        assert_eq!(stats.detail_entries[0][0].diff, "3");
+    }
+
+    #[test]
+    fn compare_records_detects_mjs_only_record() {
+        let mapping = col("出勤日数", "WORK_DAYS", 0);
+        let info = ColInfo { mapping: &mapping, mjs_idx: 1, other_idx: 1 };
+        let mjs = vec![
+            vec!["1001".to_string(), "20".to_string()],
+            vec!["9999".to_string(), "5".to_string()], // MJS側のみ
+        ];
+        let other = vec![
+            vec!["1001".to_string(), "20".to_string()],
+        ];
+        let idx = build_mjs_index(&mjs);
+        let stats = compare_records(&idx, &mjs, &other, 0, &[info]);
+
+        assert_eq!(stats.mjs_only_count, 1);
+        assert_eq!(stats.other_only_count, 0);
+    }
+
+    #[test]
+    fn compare_records_detects_other_only_record() {
+        let mapping = col("出勤日数", "WORK_DAYS", 0);
+        let info = ColInfo { mapping: &mapping, mjs_idx: 1, other_idx: 1 };
+        let mjs = vec![
+            vec!["1001".to_string(), "20".to_string()],
+        ];
+        let other = vec![
+            vec!["1001".to_string(), "20".to_string()],
+            vec!["8888".to_string(), "7".to_string()], // 他社側のみ
+        ];
+        let idx = build_mjs_index(&mjs);
+        let stats = compare_records(&idx, &mjs, &other, 0, &[info]);
+
+        assert_eq!(stats.mjs_only_count, 0);
+        assert_eq!(stats.other_only_count, 1);
+    }
+
+    #[test]
+    fn compare_records_with_tolerance_allows_small_diff() {
+        let mapping = col("残業時間", "OT_HOURS", 5);
+        let info = ColInfo { mapping: &mapping, mjs_idx: 1, other_idx: 1 };
+        let mjs = vec![
+            vec!["1001".to_string(), "100".to_string()],
+            vec!["1002".to_string(), "50".to_string()],
+        ];
+        let other = vec![
+            vec!["1001".to_string(), "103".to_string()], // 差3：許容内
+            vec!["1002".to_string(), "44".to_string()],  // 差6：許容超
+        ];
+        let idx = build_mjs_index(&mjs);
+        let stats = compare_records(&idx, &mjs, &other, 0, &[info]);
+
+        assert_eq!(stats.mismatch_counts[0], 1); // 1002 のみ不一致
+    }
+}
